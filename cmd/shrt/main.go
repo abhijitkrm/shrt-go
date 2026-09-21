@@ -69,7 +69,7 @@ func main() {
 
 // seed bulk-inserts N links if the store is empty (through the write path).
 func seed(n int) {
-	s, err := store.New(dataDir, 0)
+	s, err := store.NewFromEnv(dataDir, 0)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "seed:", err)
 		return
@@ -137,7 +137,7 @@ func listen(p int) (net.Listener, error) {
 }
 
 func serve() {
-	st, err := store.New(dataDir, instance)
+	st, err := store.NewFromEnv(dataDir, instance)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

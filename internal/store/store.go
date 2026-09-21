@@ -939,3 +939,42 @@ func (s *Store) Close() {
 	}
 	s.release()
 }
+
+// API is the store surface the HTTP layer uses. *Store (AOF engine) and
+// *KvStore (external RESP backend) both implement it.
+type API interface {
+	Shorten(url, alias string, hasAlias bool, ttlMs int64) string
+	ShortenMany(urls []string, ttlMs int64) []string
+	Resolve(code string) (string, bool)
+	Update(code, url string, ttlMs int64, hasTTL bool) MutResult
+	Remove(code string) MutResult
+	List(limit, offset int, sortBy, q string) ([]Link, int)
+	Stats(code string) *Link
+	Seed(urls []string) int
+	IsEmpty() bool
+	Flush()
+	PollTails()
+	Compact()
+	Close()
+}
+
+// NewFromEnv picks the backend: STORE=aof|local (default) uses the
+// in-process AOF engine; STORE=dragonfly|redis|kv uses an external RESP
+// store (DRAGONFLY_ADDR/KV_ADDR, CACHE entries, CACHE_TTL_MS).
+func NewFromEnv(dir string, instance int) (API, error) {
+	switch os.Getenv("STORE") {
+	case "dragonfly", "redis", "kv":
+		addr := os.Getenv("DRAGONFLY_ADDR")
+		if addr == "" {
+			addr = os.Getenv("KV_ADDR")
+		}
+		if addr == "" {
+			addr = "127.0.0.1:6379"
+		}
+		cache := int(envInt("CACHE", 100000))
+		ttl := int64(envInt("CACHE_TTL_MS", 5000))
+		return NewKV(addr, instance, cache, ttl)
+	default:
+		return New(dir, instance)
+	}
+}

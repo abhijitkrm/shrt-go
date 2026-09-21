@@ -9,7 +9,7 @@ import (
 )
 
 // StdHandler adapts Handle to net/http (the stdlib fallback frontend).
-func StdHandler(st *store.Store) http.Handler {
+func StdHandler(st store.API) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		method := r.Method
 		path := r.URL.RequestURI()

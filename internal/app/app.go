@@ -121,7 +121,7 @@ type shortenReq struct {
 	TTLMS *float64 `json:"ttl_ms"`
 }
 
-func shortenOne(st *store.Store, p *shortenReq) Reply {
+func shortenOne(st store.API, p *shortenReq) Reply {
 	if p.URL == nil || !isValidURL(*p.URL) {
 		return bad("invalid url")
 	}
@@ -167,7 +167,7 @@ type bulkReq struct {
 	URLs []string `json:"urls"`
 }
 
-func shortenBulk(st *store.Store, p *bulkReq) Reply {
+func shortenBulk(st store.API, p *bulkReq) Reply {
 	if len(p.URLs) == 0 || len(p.URLs) > MaxBulkURLs {
 		return bad(`urls must be 1-` + strconv.Itoa(MaxBulkURLs) + ` valid http(s) urls`)
 	}
@@ -202,7 +202,7 @@ type patchReq struct {
 
 // Handle is the transport-agnostic request handler. path includes the query
 // string ("...?..."); body is the raw request body (nil when absent).
-func Handle(st *store.Store, method, path string, body []byte, adminToken string) Reply {
+func Handle(st store.API, method, path string, body []byte, adminToken string) Reply {
 	pathname := path
 	query := ""
 	if i := strings.IndexByte(path, '?'); i >= 0 {

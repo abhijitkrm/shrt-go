@@ -79,6 +79,16 @@ Generated codes: exactly 8 chars, `[0-9a-zA-Z]` (`ALPHABET[instance]` prefix +
 | `CORS_ORIGIN` | `*`        | value of `Access-Control-Allow-Origin` |
 | `ADMIN_TOKEN` | unset      | enables PATCH/DELETE; requests need `x-admin-token: <value>` |
 | `LINK_TTL_MS` | `86400000` | default **and max** link lifetime — every link expires ≤1 day |
+| `STORE`       | `aof`      | `aof` in-process engine, or `dragonfly`/`redis` external RESP KV |
+| `DRAGONFLY_ADDR` | `127.0.0.1:6379` | RESP endpoint (`KV_ADDR` also accepted) |
+| `CACHE`       | `100000`   | bounded hot FIFO entries kept in-process over the KV |
+| `CACHE_TTL_MS` | `5000`    | staleness bound for cached entries |
+
+With `STORE=dragonfly` the whole corpus lives in the RESP store (keys
+`l:{code}` → `{exp}|{created}|{url}`, `h:{code}` → hit counter) — process
+memory stays flat as links grow; a cache miss costs one `GET`. Writes and
+admin mutations work on any node since the KV is the shared state. Live
+tests: `SHRT_KV_ADDR=127.0.0.1:6379 go test ./internal/store -run TestKV`.
 
 ## Performance
 

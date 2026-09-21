@@ -35,7 +35,7 @@ func respond(ctx *fasthttp.RequestCtx, r *Reply) {
 }
 
 // FastHandler adapts Handle to fasthttp (the high-performance frontend).
-func FastHandler(st *store.Store) fasthttp.RequestHandler {
+func FastHandler(st store.API) fasthttp.RequestHandler {
 	return func(ctx *fasthttp.RequestCtx) {
 		method := string(ctx.Method())
 		path := string(ctx.RequestURI())
@@ -57,7 +57,7 @@ func FastHandler(st *store.Store) fasthttp.RequestHandler {
 }
 
 // NewFastServer builds a tuned fasthttp server for the store.
-func NewFastServer(st *store.Store) *fasthttp.Server {
+func NewFastServer(st store.API) *fasthttp.Server {
 	return &fasthttp.Server{
 		Handler:                      FastHandler(st),
 		NoDefaultServerHeader:        true,
