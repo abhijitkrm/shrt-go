@@ -1,0 +1,8 @@
+data/
+*.log
+*.snap
+*.lock
+*.tmp
+/shrt
+/bin/
+.DS_Store
