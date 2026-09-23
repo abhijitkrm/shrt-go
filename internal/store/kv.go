@@ -251,6 +251,76 @@ func (k *Kv) IncrByMany(deltas map[string]int64) error {
 	return err
 }
 
+// Hget reads a hash field.
+func (k *Kv) Hget(key, field []byte) ([]byte, error) {
+	r, err := k.cmd([][]byte{[]byte("HGET"), key, field})
+	if err != nil || r.IsNull() {
+		return nil, err
+	}
+	return r.Str, nil
+}
+
+// Hsetnx sets a hash field only if absent; returns whether it was created.
+func (k *Kv) Hsetnx(key, field, val []byte) (bool, error) {
+	r, err := k.cmd([][]byte{[]byte("HSETNX"), key, field, val})
+	return err == nil && r.Int == 1, err
+}
+
+// Hset overwrites a hash field.
+func (k *Kv) Hset(key, field, val []byte) error {
+	_, err := k.cmd([][]byte{[]byte("HSET"), key, field, val})
+	return err
+}
+
+// Hdel removes hash fields; returns count removed.
+func (k *Kv) Hdel(key, field []byte) (int64, error) {
+	r, err := k.cmd([][]byte{[]byte("HDEL"), key, field})
+	return r.Int, err
+}
+
+// HIncrByMany pipelines (key,field,delta) HINCRBYs in one round-trip.
+func (k *Kv) HIncrByMany(deltas []hincr) error {
+	if len(deltas) == 0 {
+		return nil
+	}
+	cmds := make([][][]byte, 0, len(deltas))
+	for _, d := range deltas {
+		cmds = append(cmds, [][]byte{
+			[]byte("HINCRBY"), []byte(d.key), []byte(d.field),
+			[]byte(strconv.FormatInt(d.n, 10)),
+		})
+	}
+	_, err := k.pipe(cmds)
+	return err
+}
+
+type hincr struct {
+	key, field string
+	n          int64
+}
+
+// HScanEach invokes cb(field, value) for every field in a hash.
+func (k *Kv) HScanEach(key string, cb func([]byte, []byte)) error {
+	cursor := []byte("0")
+	for {
+		r, err := k.cmd([][]byte{
+			[]byte("HSCAN"), []byte(key), cursor,
+			[]byte("COUNT"), []byte("1000"),
+		})
+		if err != nil || len(r.Arr) != 2 {
+			return err
+		}
+		cursor = r.Arr[0].Str
+		items := r.Arr[1].Arr
+		for i := 0; i+1 < len(items); i += 2 {
+			cb(items[i].Str, items[i+1].Str)
+		}
+		if string(cursor) == "0" {
+			return nil
+		}
+	}
+}
+
 // ScanEach invokes cb for every key matching pat. Admin path.
 func (k *Kv) ScanEach(pat string, cb func([]byte)) error {
 	cursor := []byte("0")

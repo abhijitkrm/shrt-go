@@ -11,6 +11,7 @@
 package store
 
 import (
+	"os"
 	"crypto/rand"
 	"strconv"
 	"strings"
@@ -105,11 +106,13 @@ type KvStore struct {
 		mu sync.Mutex
 		m  map[string]int64
 	}
-	instance int
-	prefix   byte
-	stop     chan struct{}
-	wg       sync.WaitGroup
-	capShard int
+	instance    int
+	prefix      byte
+	layoutHash  bool   // KV_LAYOUT=hash: fields in l:{shard%buckets} hashes
+	buckets     uint64 // KV_BUCKETS — keep fields/bucket < hash-max-listpack-entries
+	stop        chan struct{}
+	wg          sync.WaitGroup
+	capShard    int
 }
 
 // NewKV opens a KV-backed store. cacheEntries bounds local memory;
@@ -140,6 +143,15 @@ func NewKV(addr string, instance, cacheEntries int, cacheTTLMs int64) (*KvStore,
 	for i := range s.dirty {
 		s.dirty[i].m = make(map[string]int64)
 	}
+	if os.Getenv("KV_LAYOUT") == "hash" {
+		s.layoutHash = true
+	}
+	s.buckets = 1_000_000
+	if v := os.Getenv("KV_BUCKETS"); v != "" {
+		if n, err := strconv.ParseUint(v, 10, 32); err == nil && n > 0 {
+			s.buckets = n
+		}
+	}
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
@@ -154,7 +166,74 @@ func NewKV(addr string, instance, cacheEntries int, cacheTTLMs int64) (*KvStore,
 			}
 		}
 	}()
+	if s.layoutHash {
+		sweepMS := int64(3_600_000)
+		if v := os.Getenv("KV_SWEEP_MS"); v != "" {
+			if n, err := strconv.ParseInt(v, 10, 64); err == nil && n >= 50 {
+				sweepMS = n
+			}
+		}
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			t := time.NewTicker(time.Duration(sweepMS) * time.Millisecond)
+			defer t.Stop()
+			for {
+				select {
+				case <-s.stop:
+					return
+				case <-t.C:
+					_ = s.sweepExpired()
+				}
+			}
+		}()
+	}
 	return s, nil
+}
+
+func hfield(code string) string { return "h:" + code }
+// bkey: hash-mode bucket key l:{shard(code) % buckets}
+func (s *KvStore) bkey(code string) string {
+	return "l:" + strconv.FormatUint(uint64(shardOf(code))%s.buckets, 10)
+}
+
+// sweepExpired HDELs fields whose embedded expiry is past — hash fields
+// can't carry PX, so the janitor reclaims them.
+func (s *KvStore) sweepExpired() error {
+	var buckets [][]byte
+	if err := s.kv.ScanEach("l:*", func(k []byte) { buckets = append(buckets, append([]byte(nil), k...)) }); err != nil {
+		return err
+	}
+	now := nowMs()
+	var dels [][][]byte
+	for _, b := range buckets {
+		var dead []string
+		_ = s.kv.HScanEach(string(b), func(f, v []byte) {
+			if len(f) >= 2 && f[0] == 'h' && f[1] == ':' {
+				return
+			}
+			e, _, _, ok := decVal(v)
+			if ok && e != 0 && e <= now {
+				dead = append(dead, string(f))
+			}
+		})
+		for _, f := range dead {
+			dels = append(dels, [][]byte{[]byte("HDEL"), b, []byte(f)})
+		}
+	}
+	if len(dels) > 0 {
+		_, err := s.kv.pipe(dels)
+		return err
+	}
+	return nil
+}
+
+// kvGet reads the link row from whichever layout is active.
+func (s *KvStore) kvGet(code string) ([]byte, error) {
+	if s.layoutHash {
+		return s.kv.Hget([]byte(s.bkey(code)), []byte(code))
+	}
+	return s.kv.Get([]byte(lkey(code)))
 }
 
 func lkey(code string) string { return "l:" + code }
@@ -188,6 +267,19 @@ func decVal(v []byte) (e, c int64, u string, ok bool) {
 }
 
 func (s *KvStore) flushHits() error {
+	if s.layoutHash {
+		var deltas []hincr
+		for i := range s.dirty {
+			sh := &s.dirty[i]
+			sh.mu.Lock()
+			for c, n := range sh.m {
+				deltas = append(deltas, hincr{s.bkey(c), hfield(c), n})
+			}
+			sh.m = make(map[string]int64, len(sh.m))
+			sh.mu.Unlock()
+		}
+		return s.kv.HIncrByMany(deltas)
+	}
 	deltas := make(map[string]int64, 64)
 	for i := range s.dirty {
 		sh := &s.dirty[i]
@@ -229,7 +321,7 @@ func (s *KvStore) Resolve(code string) (string, bool) {
 		s.bump(code)
 		return u, true
 	}
-	v, err := s.kv.Get([]byte(lkey(code)))
+	v, err := s.kvGet(code)
 	if err != nil || v == nil {
 		return "", false
 	}
@@ -249,8 +341,14 @@ func (s *KvStore) Shorten(url, alias string, hasAlias bool, ttlMs int64) string 
 	if ttlMs > 0 {
 		exp = now + ttlMs
 	}
+	putNX := func(code string) (bool, error) {
+		if s.layoutHash {
+			return s.kv.Hsetnx([]byte(s.bkey(code)), []byte(code), []byte(encVal(exp, now, url)))
+		}
+		return s.kv.Set([]byte(lkey(code)), []byte(encVal(exp, now, url)), ttlMs, true)
+	}
 	if hasAlias {
-		ok, err := s.kv.Set([]byte(lkey(alias)), []byte(encVal(exp, now, url)), ttlMs, true)
+		ok, err := putNX(alias)
 		if err != nil || !ok {
 			return ""
 		}
@@ -258,7 +356,7 @@ func (s *KvStore) Shorten(url, alias string, hasAlias bool, ttlMs int64) string 
 	}
 	for {
 		code := s.randCode()
-		ok, err := s.kv.Set([]byte(lkey(code)), []byte(encVal(exp, now, url)), ttlMs, true)
+		ok, err := putNX(code)
 		if err == nil && ok {
 			return code
 		}
@@ -281,11 +379,16 @@ func (s *KvStore) ShortenMany(urls []string, ttlMs int64) []string {
 	for i, u := range urls {
 		c := s.randCode()
 		codes[i] = c
-		args := [][]byte{[]byte("SET"), []byte(lkey(c)), []byte(encVal(exp, now, u))}
-		if ttlMs > 0 {
-			args = append(args, []byte("PX"), []byte(strconv.FormatInt(ttlMs, 10)))
+		var args [][]byte
+		if s.layoutHash {
+			args = [][]byte{[]byte("HSETNX"), []byte(s.bkey(c)), []byte(c), []byte(encVal(exp, now, u))}
+		} else {
+			args = [][]byte{[]byte("SET"), []byte(lkey(c)), []byte(encVal(exp, now, u))}
+			if ttlMs > 0 {
+				args = append(args, []byte("PX"), []byte(strconv.FormatInt(ttlMs, 10)))
+			}
+			args = append(args, []byte("NX"))
 		}
-		args = append(args, []byte("NX"))
 		cmds = append(cmds, args)
 	}
 	rs, err := s.kv.pipe(cmds)
@@ -297,7 +400,13 @@ func (s *KvStore) ShortenMany(urls []string, ttlMs int64) []string {
 		return codes
 	}
 	for i, r := range rs {
-		if r.Kind != '+' || string(r.Str) != "OK" {
+		ok := false
+		if s.layoutHash {
+			ok = r.Kind == ':' && r.Int == 1
+		} else {
+			ok = r.Kind == '+' && string(r.Str) == "OK"
+		}
+		if !ok {
 			codes[i] = s.Shorten(urls[i], "", false, ttlMs)
 		}
 	}
@@ -306,7 +415,7 @@ func (s *KvStore) ShortenMany(urls []string, ttlMs int64) []string {
 
 // Update overwrites url (and optionally ttl) — keeps created_at.
 func (s *KvStore) Update(code, url string, ttlMs int64, hasTTL bool) MutResult {
-	v, err := s.kv.Get([]byte(lkey(code)))
+	v, err := s.kvGet(code)
 	if err != nil || v == nil {
 		return MutMissing
 	}
@@ -322,13 +431,19 @@ func (s *KvStore) Update(code, url string, ttlMs int64, hasTTL bool) MutResult {
 			exp = 0
 		}
 	}
-	var px int64
-	if exp > 0 {
-		px = exp - nowMs()
-	}
-	okk, err := s.kv.Set([]byte(lkey(code)), []byte(encVal(exp, c, url)), px, false)
-	if err != nil || !okk {
-		return MutMissing
+	if s.layoutHash {
+		if err := s.kv.Hset([]byte(s.bkey(code)), []byte(code), []byte(encVal(exp, c, url))); err != nil {
+			return MutMissing
+		}
+	} else {
+		var px int64
+		if exp > 0 {
+			px = exp - nowMs()
+		}
+		okk, err := s.kv.Set([]byte(lkey(code)), []byte(encVal(exp, c, url)), px, false)
+		if err != nil || !okk {
+			return MutMissing
+		}
 	}
 	s.cache.remove(code)
 	return MutOK
@@ -336,11 +451,20 @@ func (s *KvStore) Update(code, url string, ttlMs int64, hasTTL bool) MutResult {
 
 // Remove deletes the link and its hit counter.
 func (s *KvStore) Remove(code string) MutResult {
-	n, err := s.kv.Del([]byte(lkey(code)))
-	if err != nil || n == 0 {
-		return MutMissing
+	if s.layoutHash {
+		b := s.bkey(code)
+		n, err := s.kv.Hdel([]byte(b), []byte(code))
+		if err != nil || n == 0 {
+			return MutMissing
+		}
+		_, _ = s.kv.Hdel([]byte(b), []byte(hfield(code)))
+	} else {
+		n, err := s.kv.Del([]byte(lkey(code)))
+		if err != nil || n == 0 {
+			return MutMissing
+		}
+		_, _ = s.kv.Del([]byte(hkey(code)))
 	}
-	_, _ = s.kv.Del([]byte(hkey(code)))
 	s.cache.remove(code)
 	return MutOK
 }
@@ -349,6 +473,9 @@ func (s *KvStore) Remove(code string) MutResult {
 func (s *KvStore) List(limit, offset int, sortBy, q string) ([]Link, int) {
 	var keys [][]byte
 	_ = s.kv.ScanEach("l:*", func(k []byte) { keys = append(keys, append([]byte(nil), k...)) })
+	if s.layoutHash {
+		return s.listHash(limit, offset, sortBy, q, keys)
+	}
 	cmds := make([][][]byte, 0, len(keys)*2)
 	for _, k := range keys {
 		code := string(k[2:])
@@ -398,9 +525,57 @@ func (s *KvStore) List(limit, offset int, sortBy, q string) ([]Link, int) {
 	return items[offset:end], total
 }
 
+// listHash reads every bucket's fields; "h:{code}" fields are hit counters.
+func (s *KvStore) listHash(limit, offset int, sortBy, q string, buckets [][]byte) ([]Link, int) {
+	hits := make(map[string]int64, 256)
+	items := make([]Link, 0, 256)
+	now := nowMs()
+	for _, b := range buckets {
+		_ = s.kv.HScanEach(string(b), func(f, v []byte) {
+			fs := string(f)
+			if rest, ok := strings.CutPrefix(fs, "h:"); ok {
+				n, _ := strconv.ParseInt(string(v), 10, 64)
+				hits[rest] = n
+				return
+			}
+			e, c, u, ok := decVal(v)
+			if !ok || (e != 0 && e <= now) {
+				return
+			}
+			if q != "" && !strings.Contains(fs, q) && !strings.Contains(u, q) {
+				return
+			}
+			l := Link{Code: fs, URL: u, CreatedAt: c}
+			if e != 0 {
+				l.ExpiresAt = &e
+			}
+			items = append(items, l)
+		})
+	}
+	for i := range items {
+		items[i].Hits = hits[items[i].Code]
+	}
+	if sortBy == "hits" {
+		for i := 1; i < len(items); i++ {
+			for j := i; j > 0 && items[j-1].Hits < items[j].Hits; j-- {
+				items[j-1], items[j] = items[j], items[j-1]
+			}
+		}
+	}
+	total := len(items)
+	if offset > total {
+		offset = total
+	}
+	end := offset + limit
+	if end > total {
+		end = total
+	}
+	return items[offset:end], total
+}
+
 // Stats returns the link view incl. unflushed local hit deltas.
 func (s *KvStore) Stats(code string) *Link {
-	v, err := s.kv.Get([]byte(lkey(code)))
+	v, err := s.kvGet(code)
 	if err != nil || v == nil {
 		return nil
 	}
@@ -412,7 +587,13 @@ func (s *KvStore) Stats(code string) *Link {
 	if e != 0 {
 		l.ExpiresAt = &e
 	}
-	if hv, err := s.kv.Get([]byte(hkey(code))); err == nil && hv != nil {
+	var hv []byte
+	if s.layoutHash {
+		hv, _ = s.kv.Hget([]byte(s.bkey(code)), []byte(hfield(code)))
+	} else {
+		hv, _ = s.kv.Get([]byte(hkey(code)))
+	}
+	if hv != nil {
 		l.Hits, _ = strconv.ParseInt(string(hv), 10, 64)
 	}
 	sh := &s.dirty[shardOf(code)]
