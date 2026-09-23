@@ -1,6 +1,6 @@
 // pebblestore.go — embedded Pebble (pure-Go LSM) backend (STORE=pebble).
 //
-// Keys:  l:{code} -> "{expires_ms}|{created_ms}|{url}"
+// Keys:  l:{code} -> "v1|{expires_ms}|{created_ms}|{url}"
 //        h:{code} -> u64 hit counter (Merge operands — no read-modify-write)
 //
 // Expiry is embedded in the value and enforced on read; a periodic sweep
@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/pebble/v2"
 
 	"shrt-go/internal/base62"
+	"shrt-go/internal/metrics"
 )
 
 // u64 merge operator for the hits namespace: operands are LE u64 deltas.
@@ -234,10 +235,14 @@ func (s *PebbleStore) linkHits(code string) int64 {
 // costs one point lookup (bloom-filtered) and fills the cache.
 func (s *PebbleStore) Resolve(code string) (string, bool) {
 	if u, _, ok := s.cache.get(code); ok {
+		metrics.CacheHit()
 		s.bump(code)
 		return u, true
 	}
+	metrics.CacheMiss()
+	t0 := time.Now()
 	v, ok := s.getLink(code)
+	metrics.StoreRead(time.Since(t0).Microseconds())
 	if !ok {
 		return "", false
 	}
@@ -253,6 +258,7 @@ func (s *PebbleStore) Resolve(code string) (string, bool) {
 // Shorten persists then hot-fills — the DB write lands before the code is
 // returned so a crash can't hand out an unpersisted link.
 func (s *PebbleStore) Shorten(url, alias string, hasAlias bool, ttlMs int64) string {
+	metrics.StoreWrite()
 	now := nowMs()
 	exp := int64(0)
 	if ttlMs > 0 {
@@ -416,6 +422,16 @@ func (s *PebbleStore) Seed(urls []string) int {
 	s.ShortenMany(urls, 0)
 	s.flushHits()
 	return len(urls)
+}
+
+// Healthy probes the DB — a missing-key read proves it is open & readable.
+func (s *PebbleStore) Healthy() bool {
+	_, closer, err := s.db.Get([]byte(""))
+	if err == nil {
+		_ = closer.Close()
+		return true
+	}
+	return err == pebble.ErrNotFound
 }
 
 func (s *PebbleStore) IsEmpty() bool {

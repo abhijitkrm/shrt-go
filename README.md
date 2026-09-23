@@ -50,7 +50,8 @@ bash scripts/smoke.sh       # CLI smoke test
 | `OPTIONS`| any                 | `204` CORS preflight |
 | `GET`    | `/`                 | single-file UI (`ui/index.html`) — 404 if absent |
 | `GET`    | `/api/metrics`      | `{req_s, total, uptime_s, per_second[31]}` — live request counters |
-| `GET`    | `/api/health`       | `{ok: true}` |
+| `GET`    | `/metrics`          | Prometheus text exposition (ops, status classes, cache hit/miss, store latency, links, uptime) |
+| `GET`    | `/api/health`       | `200` only when the backing store answers (RESP `PING` / pebble probe) — else `503` |
 
 CORS: `Access-Control-Allow-Origin` on every response (`CORS_ORIGIN` env,
 default `*`).
@@ -77,7 +78,10 @@ Generated codes: exactly 8 chars, `[0-9a-zA-Z]` (`ALPHABET[instance]` prefix +
 | `HITS`        | `1`        | `0` disables hit counting |
 | `TAIL_MS`     | `0`        | >0 enables periodic sibling-log polling (on-miss always on) |
 | `CORS_ORIGIN` | `*`        | value of `Access-Control-Allow-Origin` |
-| `ADMIN_TOKEN` | unset      | enables PATCH/DELETE; requests need `x-admin-token: <value>` |
+| `ADMIN_TOKEN` | unset      | enables PATCH/DELETE; requests need `x-admin-token: <value>` (unset/empty = always 404, fail-closed) |
+| `RATE_LIMIT`  | `0` (off)  | per-IP token bucket req/s on `POST /api/shorten` (cost 1) and `/api/shorten/bulk` (cost = url count); `429` when empty |
+| `RATE_LIMIT_BURST` | `RATE_LIMIT` | bucket capacity (max burst) |
+| `TRUST_PROXY` | unset      | when set, rate-limit keys come from the first `X-Forwarded-For` address |
 | `LINK_TTL_MS` | `86400000` | default **and max** link lifetime — every link expires ≤1 day |
 | `STORE`       | `aof`      | `aof` in-process engine, `dragonfly`/`redis` external RESP KV, or `pebble`/`rocksdb` embedded LSM |
 | `PEBBLE_PATH` | `{DATA_DIR}/pebble` | embedded DB dir for `STORE=pebble` |

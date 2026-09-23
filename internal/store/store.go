@@ -700,6 +700,9 @@ func (s *Store) Resolve(code string) (string, bool) {
 	return e.u, true
 }
 
+// Healthy: the in-process engine is healthy whenever the process is.
+func (s *Store) Healthy() bool { return true }
+
 // IsEmpty reports whether the index is empty.
 func (s *Store) IsEmpty() bool {
 	for i := range s.shards {
@@ -952,6 +955,8 @@ type API interface {
 	Stats(code string) *Link
 	Seed(urls []string) int
 	IsEmpty() bool
+	// Healthy reports whether the backing store answers (PING / probe).
+	Healthy() bool
 	Flush()
 	PollTails()
 	Compact()

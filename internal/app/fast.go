@@ -1,12 +1,29 @@
 package app
 
 import (
+	"os"
 	"strings"
 
 	"github.com/valyala/fasthttp"
 
 	"shrt-go/internal/store"
 )
+
+var trustProxy = os.Getenv("TRUST_PROXY") != ""
+
+// clientIP returns the rate-limit key: first X-Forwarded-For hop when
+// TRUST_PROXY is set, else the TCP peer.
+func clientIP(ctx *fasthttp.RequestCtx) string {
+	if trustProxy {
+		if xff := string(ctx.Request.Header.Peek("x-forwarded-for")); xff != "" {
+			if i := strings.IndexByte(xff, ','); i >= 0 {
+				return strings.TrimSpace(xff[:i])
+			}
+			return strings.TrimSpace(xff)
+		}
+	}
+	return ctx.RemoteIP().String()
+}
 
 var corsHeaders = [][2]string{
 	{"access-control-allow-methods", "GET,POST,PATCH,DELETE,OPTIONS"},
@@ -51,7 +68,7 @@ func FastHandler(st store.API) fasthttp.RequestHandler {
 				return
 			}
 		}
-		r := Handle(st, method, path, body, string(ctx.Request.Header.Peek("x-admin-token")))
+		r := Handle(st, method, path, body, string(ctx.Request.Header.Peek("x-admin-token")), clientIP(ctx))
 		respond(ctx, &r)
 	}
 }

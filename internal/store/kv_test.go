@@ -6,6 +6,7 @@ package store
 
 import (
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -155,4 +156,39 @@ func TestKVBulk(t *testing.T) {
 
 func itoa(i int) string {
 	return string(rune('0'+(i/10)%10)) + string(rune('0'+i%10))
+}
+
+func TestCodecV1(t *testing.T) {
+	v := encVal(111, 222, "https://x.example/a|b")
+	if !strings.HasPrefix(v, "v1|") {
+		t.Fatalf("no version tag: %q", v)
+	}
+	e, c, u, ok := decVal([]byte(v))
+	if !ok || e != 111 || c != 222 || u != "https://x.example/a|b" {
+		t.Fatalf("v1 roundtrip %d %d %q %v", e, c, u, ok)
+	}
+	// pre-version "{e}|{c}|{u}"
+	e, c, u, ok = decVal([]byte("111|222|https://x.example"))
+	if !ok || e != 111 || c != 222 || u != "https://x.example" {
+		t.Fatalf("legacy decode %d %d %q %v", e, c, u, ok)
+	}
+	// oldest "{e}|{u}"
+	e, c, u, ok = decVal([]byte("111|https://x.example"))
+	if !ok || e != 111 || c != 0 || u != "https://x.example" {
+		t.Fatalf("oldest decode %d %d %q %v", e, c, u, ok)
+	}
+	if _, _, _, ok = decVal([]byte("v1|")); ok {
+		t.Fatal("v1| alone must not decode")
+	}
+}
+
+func TestPebbleHealthy(t *testing.T) {
+	s, err := NewPebble(t.TempDir()+"/db", 0, 16, 5000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if !s.Healthy() {
+		t.Fatal("fresh pebble store should be healthy")
+	}
 }

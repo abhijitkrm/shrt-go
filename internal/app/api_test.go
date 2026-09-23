@@ -133,6 +133,31 @@ func TestMetrics(t *testing.T) {
 	})
 }
 
+func TestPrometheusMetrics(t *testing.T) {
+	runSuite(t, func(t *testing.T, base string, c *http.Client) {
+		shortenURL(t, c, base, "https://prom.example")
+		res := get(t, c, base+"/metrics")
+		if res.StatusCode != 200 {
+			t.Fatalf("status %d", res.StatusCode)
+		}
+		if ct := res.Header.Get("content-type"); ct != "text/plain; version=0.0.4" {
+			t.Fatalf("content-type %q", ct)
+		}
+		body := string(body(t, res))
+		for _, want := range []string{
+			"# TYPE shrt_requests_total counter",
+			`shrt_requests_total{op="shorten"}`,
+			`shrt_links_total`,
+			`shrt_uptime_seconds`,
+			`shrt_rate_limited_total`,
+		} {
+			if !strings.Contains(body, want) {
+				t.Fatalf("missing %q in:\n%s", want, body)
+			}
+		}
+	})
+}
+
 func TestUIServed(t *testing.T) {
 	runSuite(t, func(t *testing.T, base string, c *http.Client) {
 		res := get(t, c, base+"/")
@@ -398,6 +423,16 @@ func TestAdminMutations(t *testing.T) {
 		_ = body(t, res)
 		if res.StatusCode != 404 {
 			t.Fatalf("delete without token %d", res.StatusCode)
+		}
+
+		// empty ADMIN_TOKEN must also fail closed
+		os.Setenv("ADMIN_TOKEN", "")
+		req0, _ := http.NewRequest("DELETE", base+"/api/links/"+code, nil)
+		req0.Header.Set("x-admin-token", "")
+		res0, _ := c.Do(req0)
+		_ = body(t, res0)
+		if res0.StatusCode != 404 {
+			t.Fatalf("delete empty token %d", res0.StatusCode)
 		}
 
 		os.Setenv("ADMIN_TOKEN", "secret")

@@ -13,6 +13,7 @@ import (
 	"github.com/bytedance/sonic"
 
 	"shrt-go/internal/metrics"
+	"shrt-go/internal/ratelimit"
 	"shrt-go/internal/store"
 )
 
@@ -147,6 +148,7 @@ func shortenOne(st store.API, p *shortenReq) Reply {
 	if code == "" {
 		return Reply{Status: 409, Body: []byte(`{"error":"alias taken"}`)}
 	}
+	metrics.LinksDelta(1)
 	b := make([]byte, 0, len(code)+32)
 	b = append(b, `{"code":"`...)
 	b = append(b, code...)
@@ -177,6 +179,7 @@ func shortenBulk(st store.API, p *bulkReq) Reply {
 		}
 	}
 	codes := st.ShortenMany(p.URLs, LinkTTLMS)
+	metrics.LinksDelta(int64(len(codes)))
 	b := make([]byte, 0, len(codes)*10+24)
 	b = append(b, `{"count":`...)
 	b = strconv.AppendInt(b, int64(len(codes)), 10)
@@ -200,9 +203,27 @@ type patchReq struct {
 
 // ---------- handler ----------
 
+var (
+	rlOnce sync.Once
+	rl     *ratelimit.Limiter
+)
+
+func limiter() *ratelimit.Limiter {
+	rlOnce.Do(func() { rl = ratelimit.New() })
+	return rl
+}
+
 // Handle is the transport-agnostic request handler. path includes the query
-// string ("...?..."); body is the raw request body (nil when absent).
-func Handle(st store.API, method, path string, body []byte, adminToken string) Reply {
+// string ("...?..."); body is the raw request body (nil when absent);
+// client is the peer IP (or X-Forwarded-For when TRUST_PROXY is set) used
+// for RATE_LIMIT accounting.
+func Handle(st store.API, method, path string, body []byte, adminToken, client string) Reply {
+	r := route(st, method, path, body, adminToken, client)
+	metrics.Status(r.Status)
+	return r
+}
+
+func route(st store.API, method, path string, body []byte, adminToken, client string) Reply {
 	pathname := path
 	query := ""
 	if i := strings.IndexByte(path, '?'); i >= 0 {
@@ -219,16 +240,30 @@ func Handle(st store.API, method, path string, body []byte, adminToken string) R
 	case "GET":
 		switch {
 		case pathname == "/api/health":
-			return Reply{Status: 200, Body: []byte(`{"ok":true}`)}
+			metrics.Op(7)
+			if st.Healthy() {
+				return Reply{Status: 200, Body: []byte(`{"ok":true}`)}
+			}
+			return Reply{Status: 503, Body: []byte(`{"ok":false}`)}
 		case pathname == "/api/metrics":
+			metrics.Op(8)
 			return Reply{Status: 200, Body: metrics.Snapshot()}
+		case pathname == "/metrics":
+			metrics.Op(8)
+			return Reply{
+				Status: 200,
+				Body:   metrics.Prometheus(ratelimit.Limited.Load()),
+				CType:  "text/plain; version=0.0.4",
+			}
 		case pathname == "/":
+			metrics.Op(9)
 			html := UIHTML()
 			if html == nil {
 				return notFound()
 			}
 			return Reply{Status: 200, Body: html, CType: "text/html; charset=utf-8"}
 		case pathname == "/api/links":
+			metrics.Op(5)
 			p, _ := url.ParseQuery(query)
 			limit := int64(50)
 			if v := p.Get("limit"); v != "" {
@@ -256,6 +291,7 @@ func Handle(st store.API, method, path string, body []byte, adminToken string) R
 			out, _ := sonic.Marshal(map[string]any{"links": links, "total": total})
 			return Reply{Status: 200, Body: out}
 		case strings.HasPrefix(pathname, "/api/stats/"):
+			metrics.Op(6)
 			code := pathname[len("/api/stats/"):]
 			link := st.Stats(code)
 			if link == nil {
@@ -266,6 +302,7 @@ func Handle(st store.API, method, path string, body []byte, adminToken string) R
 		default:
 			code := pathname[1:]
 			if codeOK(code) {
+				metrics.Op(0)
 				if target, ok := st.Resolve(code); ok {
 					return Reply{Status: 302, Location: target}
 				}
@@ -275,6 +312,7 @@ func Handle(st store.API, method, path string, body []byte, adminToken string) R
 
 	case "POST":
 		if pathname != "/api/shorten" && pathname != "/api/shorten/bulk" {
+			metrics.Op(10)
 			return notFound()
 		}
 		if pathname == "/api/shorten" {
@@ -282,12 +320,24 @@ func Handle(st store.API, method, path string, body []byte, adminToken string) R
 			if err := sonic.Unmarshal(body, &p); err != nil {
 				return bad("invalid json")
 			}
+			if !limiter().Allow(client, 1) {
+				ratelimit.Limited.Add(1)
+				metrics.Op(10)
+				return Reply{Status: 429, Body: []byte(`{"error":"rate limited"}`)}
+			}
+			metrics.Op(1)
 			return shortenOne(st, &p)
 		}
 		var p bulkReq
 		if err := sonic.Unmarshal(body, &p); err != nil {
 			return bad("invalid json")
 		}
+		if !limiter().Allow(client, float64(max(len(p.URLs), 1))) {
+			ratelimit.Limited.Add(1)
+			metrics.Op(10)
+			return Reply{Status: 429, Body: []byte(`{"error":"rate limited"}`)}
+		}
+		metrics.Op(2)
 		return shortenBulk(st, &p)
 
 	case "PATCH", "DELETE":
@@ -299,8 +349,10 @@ func Handle(st store.API, method, path string, body []byte, adminToken string) R
 			return bad("invalid code")
 		}
 		if method == "DELETE" {
+			metrics.Op(4)
 			switch st.Remove(code) {
 			case store.MutOK:
+				metrics.LinksDelta(-1)
 				return Reply{Status: 204}
 			case store.MutMissing:
 				return notFound()
@@ -324,6 +376,7 @@ func Handle(st store.API, method, path string, body []byte, adminToken string) R
 					ttl = LinkTTLMS
 				}
 			}
+			metrics.Op(3)
 			switch st.Update(code, *p.URL, ttl, hasTTL) {
 			case store.MutOK:
 				return Reply{Status: 200, Body: []byte(`{"ok":true}`)}

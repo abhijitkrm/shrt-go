@@ -2,11 +2,31 @@ package app
 
 import (
 	"io"
+	"net"
 	"net/http"
+	"os"
 	"strings"
 
 	"shrt-go/internal/store"
 )
+
+var trustProxyStd = os.Getenv("TRUST_PROXY") != ""
+
+func clientIPStd(r *http.Request) string {
+	if trustProxyStd {
+		if xff := r.Header.Get("x-forwarded-for"); xff != "" {
+			if i := strings.IndexByte(xff, ','); i >= 0 {
+				return strings.TrimSpace(xff[:i])
+			}
+			return strings.TrimSpace(xff)
+		}
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
 
 // StdHandler adapts Handle to net/http (the stdlib fallback frontend).
 func StdHandler(st store.API) http.Handler {
@@ -31,7 +51,7 @@ func StdHandler(st store.API) http.Handler {
 			}
 			body = b
 		}
-		rp := Handle(st, method, path, body, r.Header.Get("x-admin-token"))
+		rp := Handle(st, method, path, body, r.Header.Get("x-admin-token"), clientIPStd(r))
 		writeStd(w, &rp)
 	})
 }

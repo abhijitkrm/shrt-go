@@ -2,7 +2,7 @@
 // The corpus lives in the KV store; this process keeps only a bounded hot
 // FIFO cache + batched hit counters — memory stays flat as links grow.
 //
-// Keys:  l:{code} -> "{expires_ms}|{created_ms}|{url}"  (PX self-evicts)
+// Keys:  l:{code} -> "v1|{expires_ms}|{created_ms}|{url}"  (PX self-evicts)
 //        h:{code} -> hit counter (INCRBY, flushed in 5ms batches)
 //
 // Multi-instance: the KV IS the shared state — no tailing, no convergence,
@@ -11,14 +11,15 @@
 package store
 
 import (
-	"os"
 	"crypto/rand"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"shrt-go/internal/base62"
+	"shrt-go/internal/metrics"
 )
 
 type cacheEnt struct {
@@ -100,19 +101,19 @@ func (c *kvCache) remove(code string) {
 
 // KvStore implements API backed by an external RESP store.
 type KvStore struct {
-	kv       *Kv
-	cache    *kvCache
-	dirty    [numShards]struct {
+	kv    *Kv
+	cache *kvCache
+	dirty [numShards]struct {
 		mu sync.Mutex
 		m  map[string]int64
 	}
-	instance    int
-	prefix      byte
-	layoutHash  bool   // KV_LAYOUT=hash: fields in l:{shard%buckets} hashes
-	buckets     uint64 // KV_BUCKETS — keep fields/bucket < hash-max-listpack-entries
-	stop        chan struct{}
-	wg          sync.WaitGroup
-	capShard    int
+	instance   int
+	prefix     byte
+	layoutHash bool   // KV_LAYOUT=hash: fields in l:{shard%buckets} hashes
+	buckets    uint64 // KV_BUCKETS — keep fields/bucket < hash-max-listpack-entries
+	stop       chan struct{}
+	wg         sync.WaitGroup
+	capShard   int
 }
 
 // NewKV opens a KV-backed store. cacheEntries bounds local memory;
@@ -192,6 +193,7 @@ func NewKV(addr string, instance, cacheEntries int, cacheTTLMs int64) (*KvStore,
 }
 
 func hfield(code string) string { return "h:" + code }
+
 // bkey: hash-mode bucket key l:{shard(code) % buckets}
 func (s *KvStore) bkey(code string) string {
 	return "l:" + strconv.FormatUint(uint64(shardOf(code))%s.buckets, 10)
@@ -240,11 +242,15 @@ func lkey(code string) string { return "l:" + code }
 func hkey(code string) string { return "h:" + code }
 
 // value codec "{e}|{c}|{u}" — legacy "{e}|{u}" decodes with c=0.
+// Value codec: "v1|{e}|{c}|{u}". The version tag lets future schema
+// changes decode old corpora; legacy "{e}|{c}|{u}" and "{e}|{u}" decode
+// with c=0.
 func encVal(e, c int64, u string) string {
-	return strconv.FormatInt(e, 10) + "|" + strconv.FormatInt(c, 10) + "|" + u
+	return "v1|" + strconv.FormatInt(e, 10) + "|" + strconv.FormatInt(c, 10) + "|" + u
 }
 func decVal(v []byte) (e, c int64, u string, ok bool) {
 	s := string(v)
+	s = strings.TrimPrefix(s, "v1|")
 	p := strings.IndexByte(s, '|')
 	if p < 0 {
 		return 0, 0, "", false
@@ -318,10 +324,14 @@ func (s *KvStore) randCode() string {
 // costs one KV GET and fills the cache.
 func (s *KvStore) Resolve(code string) (string, bool) {
 	if u, _, ok := s.cache.get(code); ok {
+		metrics.CacheHit()
 		s.bump(code)
 		return u, true
 	}
+	metrics.CacheMiss()
+	t0 := time.Now()
 	v, err := s.kvGet(code)
+	metrics.StoreRead(time.Since(t0).Microseconds())
 	if err != nil || v == nil {
 		return "", false
 	}
@@ -336,6 +346,7 @@ func (s *KvStore) Resolve(code string) (string, bool) {
 
 // Shorten creates a link; "" if the alias is taken.
 func (s *KvStore) Shorten(url, alias string, hasAlias bool, ttlMs int64) string {
+	metrics.StoreWrite()
 	now := nowMs()
 	var exp int64
 	if ttlMs > 0 {
@@ -608,6 +619,12 @@ func (s *KvStore) Seed(urls []string) int {
 	s.ShortenMany(urls, 0)
 	_ = s.flushHits()
 	return len(urls)
+}
+
+// Healthy PINGs the RESP server — the /api/health probe.
+func (s *KvStore) Healthy() bool {
+	r, err := s.kv.cmd([][]byte{[]byte("PING")})
+	return err == nil && r.Kind == '+' && string(r.Str) == "PONG"
 }
 
 // IsEmpty reports whether the corpus has no links.
