@@ -79,7 +79,9 @@ Generated codes: exactly 8 chars, `[0-9a-zA-Z]` (`ALPHABET[instance]` prefix +
 | `CORS_ORIGIN` | `*`        | value of `Access-Control-Allow-Origin` |
 | `ADMIN_TOKEN` | unset      | enables PATCH/DELETE; requests need `x-admin-token: <value>` |
 | `LINK_TTL_MS` | `86400000` | default **and max** link lifetime — every link expires ≤1 day |
-| `STORE`       | `aof`      | `aof` in-process engine, or `dragonfly`/`redis` external RESP KV |
+| `STORE`       | `aof`      | `aof` in-process engine, `dragonfly`/`redis` external RESP KV, or `pebble`/`rocksdb` embedded LSM |
+| `PEBBLE_PATH` | `{DATA_DIR}/pebble` | embedded DB dir for `STORE=pebble` |
+| `PEBBLE_SWEEP_MS` | `3600000` | interval for the expired-key sweep (pebble mode) |
 | `DRAGONFLY_ADDR` | `127.0.0.1:6379` | RESP endpoint (`KV_ADDR` also accepted) |
 | `CACHE`       | `100000`   | bounded hot FIFO entries kept in-process over the KV |
 | `CACHE_TTL_MS` | `5000`    | staleness bound for cached entries |
@@ -89,6 +91,15 @@ With `STORE=dragonfly` the whole corpus lives in the RESP store (keys
 memory stays flat as links grow; a cache miss costs one `GET`. Writes and
 admin mutations work on any node since the KV is the shared state. Live
 tests: `SHRT_KV_ADDR=127.0.0.1:6379 go test ./internal/store -run TestKV`.
+
+`STORE=pebble` keeps the corpus on local disk in an embedded Pebble LSM
+(keys `l:{code}` → `{exp}|{created}|{url}`, `h:{code}` → u64 counter via a
+merge operator — no read-modify-write). Expiry is enforced on read plus a
+periodic `PEBBLE_SWEEP_MS` iterator sweep. Reads hit the same bounded FIFO
+cache first, so the DB only sees misses; bulk shorten is one batch. Pebble
+holds an exclusive file lock on the dir — one process per `PEBBLE_PATH`;
+for multi-instance/multi-node use the `dragonfly`/`redis` backend. Tests
+run in-process: `go test ./internal/store -run TestPebble`.
 
 ## Performance
 

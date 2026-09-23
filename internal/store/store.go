@@ -960,9 +960,19 @@ type API interface {
 
 // NewFromEnv picks the backend: STORE=aof|local (default) uses the
 // in-process AOF engine; STORE=dragonfly|redis|kv uses an external RESP
-// store (DRAGONFLY_ADDR/KV_ADDR, CACHE entries, CACHE_TTL_MS).
+// store (DRAGONFLY_ADDR/KV_ADDR, CACHE entries, CACHE_TTL_MS);
+// STORE=pebble|rocksdb uses embedded Pebble (PEBBLE_PATH or {dir}/pebble,
+// single-writer file lock).
 func NewFromEnv(dir string, instance int) (API, error) {
 	switch os.Getenv("STORE") {
+	case "pebble", "rocksdb":
+		path := os.Getenv("PEBBLE_PATH")
+		if path == "" {
+			path = dir + "/pebble"
+		}
+		cache := int(envInt("CACHE", 100000))
+		ttl := int64(envInt("CACHE_TTL_MS", 5000))
+		return NewPebble(path, instance, cache, ttl)
 	case "dragonfly", "redis", "kv":
 		addr := os.Getenv("DRAGONFLY_ADDR")
 		if addr == "" {
